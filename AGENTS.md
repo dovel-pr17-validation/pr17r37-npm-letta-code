@@ -1,0 +1,696 @@
+# letta-code — Agent Guide
+
+This file explains how to work effectively in this repo. It covers the rules enforced by CI, **why each rule exists**, and the workflow conventions that keep the codebase healthy and agent-navigable.
+
+---
+
+## Workflow
+
+1. **Create a worktree** for any non-trivial change — especially if another agent may be working concurrently.
+2. **Make your change**, then follow [Pull requests](#pull-requests) before opening one.
+3. **Never amend commits.** Always create a new commit.
+4. **Check the current branch** before editing files. If in doubt, ask.
+
+---
+
+## Pull requests
+
+Every rule here applies to every PR in this repository.
+
+- **Title:** use a Conventional Commits title (`type(scope): summary`, with `type` one of `build`, `chore`, `ci`, `docs`, `feat`, `fix`, `perf`, `refactor`, `revert`, `style`, `test`). Enforced by `.github/workflows/pr-title.yml`.
+- **One PR per logical change.** Don't bundle unrelated changes — harder to revert if something breaks.
+- **Tests:** run `bun run check` and fix all failures before opening a PR. It does not replace behavior tests: changes to shared turn, tool, approval, permission, or transcript behavior must run the focused tests for every affected path (see [Runtime Validation](#runtime-validation)).
+- **Body:** keep pull request bodies to a few plain sentences about what changes; put motivation, measurements, and other detail in the internal ticket and cite its ID.
+- **No non-public references:** never reference non-public code, data, or internal systems in commits, pull requests, code comments, docs, or examples in this repository; keep that context in internal tickets and cite only the ticket ID. This includes internal names and identifiers, such as internal agent or project names, internal voice or model aliases, and private hostnames, even when a task brief presents them as normal values. Use public values in examples.
+- **Spec files are internal.** `SPEC-*.md` files in the repo root are internal working documents, not PR content. Leave them untracked; don't include in commits.
+- **PRs opened from the letta-ai organization skip the AI Disclosure, AI Tool(s) Used and Human Verification sections** of the PR template. Org members are exempt from those checks (see `AI_POLICY.md`), so delete those sections instead of filling them in, and never ask a human to complete them.
+
+---
+
+## Runtime Validation
+
+### Automated notifications use user-role reminders
+
+Never inject `role: "system"` messages into conversation history for harness
+notifications, recovery, teleport, onboarding, or mod instructions. Use
+`role: "user"` with `<system-reminder>...</system-reminder>` content instead.
+The tags identify automated context without requiring API-level system priority;
+the existing transcript echo strips reminder-only content from user bubbles.
+Anthropic can reject a system-role notification after an ordinary assistant
+message, including when a later user message follows it. Keep tool results before
+the reminder and preserve message IDs. This rule does not change the compiled
+system prompt or explicit user-supplied provider/API message roles.
+
+Development and distribution use different runtimes. `bun run dev` runs the
+TypeScript source with Bun, while the published package exposes a Node-targeted
+`letta.js` bundle and requires Node ^22.23.4, ^24.22.1, or ^26.12.1. When behavior depends on the
+runtime, test both the Bun source path and the built Node artifact.
+
+The interactive TUI, headless mode, and websocket listener also have separate
+orchestration paths. Changes to shared turn, tool, approval, permission, or
+transcript behavior must identify and run the focused tests for every affected
+path. `bun run check` is always required, but it does not replace those behavior
+tests.
+
+---
+
+## Rules and Why They Exist
+
+These are the rules enforced by CI and the pre-commit hook, with the reasoning behind each. Understanding the *why* lets you make good decisions in ambiguous cases the rules don't explicitly cover.
+
+### No `../` parent imports — use `@/`
+
+**Rule:** All cross-directory imports must use the `@/` alias (`@/` maps to `src/`). Relative parent paths (`../`) are banned and blocked by pre-commit.
+
+**Why:** Agents navigate codebases by searching. `import { getBackend } from "@/backend"` is immediately grep-discoverable anywhere in the repo. `import { getBackend } from "../../backend"` requires resolving the path from the current file's location — fragile to moves and opaque to search. Consistent absolute paths also make codemods reliable: a rename script can find all import sites with a simple grep.
+
+```ts
+// correct
+import { getBackend } from "@/backend";
+import { isDebugEnabled } from "@/utils/debug";
+
+// wrong — blocked by pre-commit hook
+import { getBackend } from "../../backend";
+```
+
+**Four files are exempt** (they legitimately live above `src/`): `src/version.ts`, `src/index.ts`, `src/cli/cli.ts`, `src/cli/app/App.tsx`. Same-directory `./` imports are always fine.
+
+---
+
+### Kebab-case `.ts` filenames, PascalCase `.tsx`
+
+**Rule:** `.ts` source files use kebab-case (`local-store.ts`). `.tsx` component files use PascalCase (`AgentSelector.tsx`). Enforced by `scripts/check-filename-casing.js` in pre-commit and CI.
+
+**Why:** Agents evaluate code quality by how searchable a codebase is. Inconsistent casing (`localStore.ts`, `LocalStore.ts`, `local-store.ts`) means a grep pattern that works for one file fails for another. macOS's case-insensitive filesystem makes this worse — `existsSync("bash.ts")` returns `true` when `Bash.ts` exists, silently breaking rename scripts. Kebab-case `.ts` is also consistent with how Node/Bun resolves modules on Linux CI (case-sensitive).
+
+---
+
+### Named exports everywhere — no default exports
+
+**Rule:** All exports must be named. Default exports are banned (`style/noDefaultExport` biome rule).
+
+**Why:** `grep 'export function AgentSelector'` finds the definition in one shot. With a default export, `export default function` tells you nothing about what the consumer will call it — each import site can rename it arbitrarily, making codebase-wide search unreliable.
+
+---
+
+### `export function` over `export const fn = () =>`
+
+**Rule:** Exported functions must use the `export function` declaration form. `export const fn = () =>` is flagged by `scripts/check-exported-functions.js`. Exception: `.tsx` files wrapping `React.memo()`.
+
+**Why:** Same grep-discoverability principle. `grep 'export function foo'` finds every exported function definition in one query. `export const` mixes function declarations with value exports — agents can't distinguish them without reading the right-hand side. `export function` is also hoisted, making it order-independent.
+
+```ts
+// correct
+export function computeThing(x: string): number { ... }
+
+// wrong — flagged by check-exported-functions.js
+export const computeThing = (x: string): number => { ... }
+```
+
+---
+
+### No circular dependencies
+
+**Rule:** Zero circular imports. Enforced by madge (`check:cycles`) in pre-commit and CI. The current baseline is exactly 0.
+
+**Why:** Circular imports cause subtle initialization-order bugs (module A's top-level code runs before module B has finished initializing, even though A imports from B). They also make the dependency graph impossible to reason about — you can't understand a file in isolation if its transitive dependencies loop back to it. The layer map below only has meaning if the graph is acyclic.
+
+---
+
+### Source files stay below 1,000 lines
+
+**Rule:** New source and test files must not exceed 1,000 lines. Existing
+oversized files are pinned in `scripts/source-file-size-baseline.json`: they may
+shrink, but they may not grow. Lower the baseline in the same change whenever an
+oversized file gets smaller, and remove its entry once it reaches the limit.
+
+**Why:** Agents commonly inspect large files in slices and miss distant state,
+cleanup, or fallback paths. Responsibility-sized modules make the whole behavior
+readable in one pass and give tests an obvious home.
+
+---
+
+### Import from the owner, not an implementation barrel
+
+**Rule:** Import a symbol from the module that defines it. Do not turn concrete
+implementation entrypoints such as channel adapters into convenience barrels.
+Scoped ownership rules are enforced by `scripts/check-module-ownership.js`.
+
+**Why:** Forwarding exports hide where behavior lives, inflate dependency graphs,
+and make agents open orchestration files when they need a small helper. Public
+package entrypoints may still re-export their intentional API surface.
+
+---
+
+### Layer boundaries — no upward imports
+
+**Rule:** Files may only import from the same layer or layers below them. Violations are caught by `scripts/check-layer-boundaries.js` in pre-commit and CI.
+
+**Why:** Coupling a lower layer to a higher layer collapses the abstraction. If `backend/` imports from `cli/`, you can no longer use the backend without the UI — tests become harder to write, and changes to the UI risk breaking storage logic. The boundary rules make each layer independently testable and make it safe to change or swap implementations.
+
+```
+cli/           ← Ink UI, commands, overlays
+websocket/     ← WS listener, session management
+agent/         ← domain: conversation, approval, context
+tools/         ← tool implementations
+backend/       ← API/storage abstraction
+providers/     ← LLM adapters (Anthropic, OpenAI)
+permissions/   ← pure permission rules (no UI deps)
+telemetry/     ← leaf: observability
+cron/          ← leaf: scheduler
+channels/      ← leaf: integrations
+utils/         ← bottom: no domain deps
+```
+
+**Enforced rules:**
+- `tools/` cannot import from `cli/`
+- `backend/` cannot import from `cli/` or `websocket/`
+- `providers/` cannot import from `agent/` or `cli/`
+- `websocket/listener/` cannot import `backend/api/client` or `backend/api/conversations` directly
+- `cli/app/` cannot import `backend/api/conversations` directly
+
+**When adding a new file:** put it in the lowest layer whose dependencies it needs. If you find yourself importing from a higher layer, extract the shared logic into a lower one instead.
+
+---
+
+### Unused locals and parameters are errors
+
+**Rule:** `noUnusedLocals` and `noUnusedParameters` are enabled in `tsconfig.json`. `tsc --noEmit` runs on every commit.
+
+**Why:** Unused symbols mislead agents into thinking something is needed when it isn't. Dead code is the most common source of incorrect assumptions when exploring an unfamiliar codebase. Keeping the signal-to-noise ratio high makes grep results meaningful.
+
+- Use `_prefix` for intentionally unused parameters (`_event`, `_index`).
+- Use `void x` to discard a value without creating a binding.
+- TypeScript exempts `_`-prefixed names from the check, but NOT function declarations (`function _foo()` is still flagged — use `void` instead).
+
+---
+
+### Test mock isolation
+
+**Rule:** `mock.module()` calls must follow isolation patterns checked by `scripts/check-test-mock-isolation.js`.
+
+**Why:** In Bun, `mock.module()` is applied to the **global module registry** of the worker process — not scoped to the current test file. Mocks leak to all other test files running in the same worker. A mock set in `foo.test.ts` can silently affect `bar.test.ts` if they share a worker, even though `bar.test.ts` never asked for it. This produces failures that only appear in the full test suite, not in isolation.
+
+Practical rules:
+- Prefer dependency injection or object-level stubbing over module-level mocking.
+- Don't mock broad shared modules (`settings-manager`, telemetry, etc.).
+- If a test file must use `mock.module()`, register it with a reason in `scripts/isolated-unit-tests.json`; `scripts/run-unit-tests.cjs` will run it in a standalone Bun process, and the mock-isolation check rejects unregistered top-level mocks.
+- If a test passes alone but fails in `bun test src/`, suspect mock leakage first.
+
+---
+
+## Directory Guides
+
+Some directories carry their own binding `AGENTS.md` with rules that override
+generic instincts. Read the local guide before changing code there:
+
+- `src/cli/AGENTS.md` — Ink rendering, approvals, and interactive input rules
+  for the TUI.
+- `src/websocket/listener/AGENTS.md` — turn lifecycle, leases, approvals, queue
+  gating, and where listener tests belong.
+- `src/channels/AGENTS.md` — gateway policy placement and the pure-logic
+  package subpaths shared with remote hosts.
+- `src/channels/slack/AGENTS.md` — Slack module ownership, the progress
+  contract, and live verification requirements.
+- `src/mods/AGENTS.md` — mod/extension architecture, capabilities, events,
+  panels, dialogs, secrets, publishing, and the subagent lifecycle API.
+- `src/sandbox/AGENTS.md` — filesystem sandbox enforcement surfaces, backends,
+  and cross-backend policy.
+- `vendor/AGENTS.md` — vendored Ink patches (red zone).
+- `.github/workflows/AGENTS.md` — upstream release watchers, CI workflow
+  patterns, the review workflow, and the release cascade.
+
+---
+
+## Placing New Files
+
+| What you're adding | Where it goes |
+|--------------------|---------------|
+| Ink component (UI only) | `src/cli/components/` |
+| Command handler | `src/cli/commands/` |
+| Hook used in App | `src/cli/app/` or `src/cli/hooks/` |
+| WS listener logic | `src/websocket/listener/` |
+| Agent/conversation domain logic | `src/agent/` |
+| Tool implementation | `src/tools/impl/` |
+| Backend abstraction | `src/backend/` |
+| LLM provider adapter | `src/providers/` |
+| Pure utility (no domain deps) | `src/utils/` |
+| Shared test helpers | `src/test-utils/` |
+| Build/lint scripts | `scripts/` |
+
+Test files live **next to their source** (`local-store.test.ts` next to `local-store.ts`), not in a separate `tests/` directory.
+
+---
+
+## Reference
+
+### Commands
+
+| Task | Command |
+|------|---------|
+| Install deps | `bun install` |
+| Full check suite | `bun run check` |
+| Auto-fix lint/format | `bun run fix` |
+| Type check only | `bun run typecheck` |
+| Run a single test file | `bun test src/path/to/file.test.ts` |
+| Run all unit tests | `bun test $(find src -name "*.test.ts" \| grep -v integration-tests)` |
+| Dev mode | `bun run dev` (sets `LETTA_DEBUG=1` by default) |
+
+`bun run fix` only auto-fixes biome violations (format + lint autofixes). The
+architectural checks and TypeScript errors need manual fixes. The pre-commit hook
+also rejects staged parent-relative imports (`../`); use the `@/` alias.
+
+### Check Suite (what each check does)
+
+1. **cycles** — `madge --circular src/`; must be exactly 0
+2. **boundaries** — `scripts/check-layer-boundaries.js`; checks import direction per layer
+3. **exported-functions** — `scripts/check-exported-functions.js`; flags `export const fn =`
+4. **filename-casing** — `scripts/check-filename-casing.js`; enforces source naming conventions
+5. **source-file-size** — `scripts/check-source-file-size.js`; enforces the 1,000-line ceiling and ratchet
+6. **module-ownership** — `scripts/check-module-ownership.js`; protects orchestration modules from barrel imports/exports
+7. **test-mock-isolation** — `scripts/check-test-mock-isolation.js`; flags unsafe `mock.module` patterns
+8. **test-coverage** — `scripts/check-test-coverage.cjs`; checks source/test coverage policy
+9. **skill-frontmatter** — checks every `SKILL.md` has a non-empty `name:` header
+10. **bundled-skill-scripts** — validates scripts shipped with bundled skills
+11. **biome** — format + lint across source files
+12. **typescript** — full `tsc --noEmit`
+
+### Environment Variables
+
+| Variable | Effect |
+|----------|--------|
+| `LETTA_DEBUG=1` | Verbose debug output (default in `bun run dev`) |
+| `LETTA_DEBUG=0` | Suppress debug output even in dev mode |
+| `LETTA_LOCAL_BACKEND_EXPERIMENTAL=1` | Enable local in-process backend |
+| `LETTA_LOCAL_BACKEND_EXECUTOR=deterministic` | Use fake deterministic executor (for tests) |
+| `LETTA_LOCAL_BACKEND_DIR` | Local-backend storage root (defaults to `<product-config>/lc-local-backend`) |
+| `LETTA_CONFIG_DIR` | Absolute global config directory (defaults to `~/.letta`); product hosts use this to isolate settings, credentials, device identity, schedules, channel accounts/sessions, remote-session state, durable listener control state, global skills, and listener locks without replacing `HOME` |
+| `LETTA_SECRETS_SERVICE_NAME` | OS-keychain service namespace for hosts that isolate credentials (defaults to `letta-code`) |
+| `LETTA_DEFAULT_SUBAGENT_COMPUTER` | `computer` used by Agent launches that omit one (e.g. `cloud`). Explicit `computer` wins; `local`/`self` force the current machine. Ignored by forks and memory-profile subagents. Unset = no change |
+
+When manually smoke-testing the local backend (`letta --backend local` or
+`bun run dev --backend local`), set `LETTA_LOCAL_BACKEND_DIR` to a temporary
+directory first. Otherwise the run reads and mutates your real
+`~/.letta/lc-local-backend` provider, auth, and transcript state.
+
+### Known Gotchas
+
+- **Prettier is not used.** Biome is the sole formatter. Do not add Prettier — they conflict.
+- **`new URL("./path.ts", import.meta.url)` in tests** is not a static import and is not caught by the `@/` import codemod. Scan for `new URL(` manually when moving source files.
+- **grep exits 1 on no matches** — pre-commit hooks use `|| true` on grep pipes to prevent false failures on clean commits.
+- **macOS case-insensitive FS** — `existsSync("bash.ts")` returns `true` when `Bash.ts` exists. Rename scripts that use `existsSync` to check kebab-case targets will silently skip single-word PascalCase files. Use `git mv` for renames.
+- **Native modules can behave differently under Bun and Node.** The published package runs the bundled `letta.js` under Node (^22.23.4, ^24.22.1, or ^26.12.1), while `bun run dev` runs the source under Bun. Example: `node-pty` is loaded directly under Node but through a Node bridge process under Bun, because its native handles do not integrate reliably with Bun's event loop (`src/tools/impl/shell-runner.ts`). Test runtime-sensitive code on both paths.
+- **`setTimeout(fn, 0)` fires on the next tick, not never.** For "no timeout" behavior, check the timeout value before scheduling the timer instead of passing 0.
+- **Extend `@letta-ai/letta-client` types instead of redeclaring them.** Use the SDK's `ToolCall`, `StopReasonType`, and similar wire types directly; do not duplicate wire shapes or cast with `as any`.
+- **Package subpath entrypoints use relative imports and dedicated entry files.** Library entries (`src/agent-presets.ts`, `src/channels-*.ts`, `src/app-server-client.ts`) are bundled separately and their emitted `.d.ts` files go through an alias rewrite in `build.js`; anything reachable from a browser-targeted entry must stay free of node builtins and backend/provider imports. Consumers on `moduleResolution: "node"` resolve subpath types through `typesVersions` in `package.json`, so new subpaths need entries there too.
+- **When changing a function from swallowing errors to throwing**, check every caller; each may need different handling.
+
+- **Headless duplicates App.tsx logic.** `headless.ts` has its own approval
+  handling loop (not shared with App.tsx). When making changes to
+  streaming/approval logic, check if headless.ts needs matching changes.
+- **`protocol_v2.ts` changes propagate to consumers.** Used by the desktop app.
+  Changes likely need to propagate upstream.
+- **Agent loop naming is confusing.** `letta_agent_v1` is the agent_type name
+  but runs on `letta_agent_v3.py`. `letta_agent_v2.py` is summarization retry
+  wrapper. Don't mix up naming in code review.
+- **Token counting differs by provider.** Anthropic: `input_tokens` excludes
+  cached (total = input + cache_creation + cache_read). Gemini:
+  `prompt_token_count` already includes cached. Getting this wrong breaks
+  summarizer triggering.
+- **OTID workaround.** Backend returns same OTID for reasoning and tool_call in
+  same step. Client suffixes OTID with message type to differentiate. Without
+  this, reasoning before tool calls gets swallowed.
+- **Agent-adapter mod import cache sharing.** Agent adapters share the default
+  mod import cache. Two agents loading the same mod code share top-level module
+  state. Per-agent isolation doesn't extend to mod-level mutable state.
+- **`/reload` does not reload app TypeScript source.** Only re-reads mods and
+  settings. Changes to app TypeScript files require a full process restart.
+  New slash commands added to the registry also require a full restart.
+- **`settingsManager` is a global singleton in tests.** State persists between
+  tests. Tests that use it must call `await settingsManager.reset()` and
+  `await settingsManager.initialize()` before running. Redirect `HOME` to a
+  temp dir before `initialize()` to avoid reading the user's actual settings.
+- **Prettier version mismatch.** Local `bunx prettier` may resolve to a newer
+  version than CI uses. Always format with the pinned version from
+  `package.json`.
+- **`bun.lock` churn.** Running `bun install` in a worktree may add
+  `"configVersion": 0` due to a newer Bun version. Scrub with `git checkout
+  main -- bun.lock` when the PR has no real package.json change.
+- **Desktop setup: never bare `npm install`.** Running bare `npm install` in the
+  letta-code workspace can prune `nx-electron` (installed `--no-save` at repo
+  root), breaking the electron IPC bridge. Always use the desktop workspace's
+  canonical setup steps.
+- **Remote log rotation.** `~/.letta/logs/remote/` grows unbounded. Long
+  desktop sessions can produce 50GB+ in a single log file. Not yet fixed.
+- **TUI-specific gotchas** (`*Rich.tsx` naming, the glyph registry, threading
+  state through app subsystems) live in `src/cli/AGENTS.md`.
+- **Settings manager 3-level precedence.** Global, project, local. When adding
+  a new configurable setting, add the field to ALL THREE settings interfaces,
+  add to project settings loading, and add collision routing in `updateSettings`.
+
+---
+
+## Code Review Signals
+
+When reviewing PRs (yours or others'), watch for these patterns. They are the
+most common sources of bugs in this codebase.
+
+TUI-specific signals (TUI flicker, Ink `<Static>` double-printing, interrupt
+lock / state cleanup) live in `src/cli/AGENTS.md`; vendored Ink patches live in
+`vendor/AGENTS.md`.
+
+### Tool Call Desync
+
+Two separate accumulation paths (UI buffers vs `StreamProcessor`) for tool call
+data can desync. `queuedApprovalResults` not cleared after send -> stale results
+resent. Interrupt handler marking tools cancelled even when execution completed.
+
+- **Review signal:** any PR touching approval flow, tool execution, or
+  interrupt handling.
+
+### Shell Tool Parity Gap
+
+Policy/UI layer treats both shell tools (`Bash`, `exec_command`) identically,
+but the implementations differ (`impl/bash.ts` vs `impl/exec-command.ts`).
+Features added to one may be missing from the other.
+
+- **Review signal:** any shell tool change, check both tools have parity.
+
+### Impossible-State PRs
+
+When a PR addresses a corrupted/impossible state (e.g. `isProcessing=true` but
+`loopStatus=WAITING_ON_INPUT`), the fix must trace and fix the **producer**,
+the code path that creates the bad state. Teaching the consumer to tolerate
+corrupted state is a workaround, not a fix.
+
+**Red flags:**
+1. Self-heal guard / state normalizer as primary correctness mechanism (a
+   function that checks for an "impossible" state and silently fixes it).
+   Acceptable as defense-in-depth + telemetry, but NEVER as the primary fix.
+2. Tests that hand-construct the bad state (manually setting contradictory flags)
+   only prove the recovery code works, they don't prove the production path is
+   fixed.
+3. PR description says "exact trigger not proven" or "likely event chain is..."
+   , the fix is speculative.
+4. Boolean terminal outcomes shared across cleanup layers, use a
+   discriminated result (`continue | completed | interrupted | error`) instead.
+
+### pi-ai Ownership Boundary
+
+Letta Code depends on `@earendil-works/pi-ai` specifically so that pi-ai owns:
+provider payload conversion, model capability enforcement (e.g. downgrading
+image parts for text-only models), the model catalog, and env key resolution.
+
+LC's responsibility ends at a narrow seam: guarantee that only canonical,
+type-valid `LocalMessage` content enters the pi Context (ingestion sanitizers in
+`local-store.ts`, `toPiMessage`/`toPiMessages` in `pi-stream-adapter.ts`).
+
+**Any PR that adds capability-gated payload sanitization, image stripping,
+provider format fixups, or model-capability checks inside the LC adapter/dispatch
+layer is suspicious by default.** Before approving:
+1. Demand the failing transcript/payload that shows the root cause.
+2. Check pi-ai's installed source (`node_modules/@earendil-works/pi-ai/dist`) for
+   the same behavior.
+3. If LC genuinely needs a belt-and-braces invariant, it belongs at the
+   `toPiMessage` boundary and must be capability-independent.
+4. Tests that use `as never` / `as any` to inject message shapes are proof no
+   typed producer emits those shapes, they pin fiction.
+
+This generalizes: for ANY dependency adopted to own a domain (pi-ai for
+providers, letta-client for API types, Ink for rendering), a PR re-implementing
+that domain inside letta-code needs explicit justification.
+
+### Leaked Module Mocks in Tests
+
+`mock.module()` is applied to the global module registry of the Bun worker
+process, not scoped to the current test file. A mock set in `foo.test.ts` can
+silently affect `bar.test.ts` if they share a worker.
+
+- If a test file must use `mock.module()`, register it in
+  `scripts/isolated-unit-tests.json` so it runs in a standalone Bun process.
+- Save real implementations before mocking, restore in `afterAll`.
+- **Review signal:** any test using `mock.module()` without `afterAll`
+  restoration, especially if the mocked module is consumed by other test files.
+
+### Don't Rename Existing Test Fixtures
+
+When adding a feature that uses a different provider/entity name, ADD new
+tests, don't rename existing test references. Bulk-renaming entity names in
+existing tests creates unnecessary diff noise.
+
+- **Review signal:** any PR that bulk-renames entity names in existing tests
+  when the rename isn't the PR's purpose.
+
+---
+
+## App-Server Protocol
+
+The v2 app-server protocol (`src/types/protocol_v2.ts`) is the runtime-scoped
+protocol for Desktop/app-server. It replaces the v1 session/headless protocol.
+
+### Adding a Protocol Command
+
+1. Add the command interface near related commands in `protocol_v2.ts`.
+2. Add it to the `WsProtocolCommand` union type.
+3. Add a handler in `src/websocket/listener/message-router.ts`.
+4. If it needs a response: add a response interface and add it to
+   `WsProtocolMessage` union.
+5. Update `src/websocket/listener/protocol-inbound.ts` for outbound parsing.
+6. Add an `AppServerClient` helper method + tests in the same PR. Don't ship
+   protocol commands without their client ergonomic.
+7. Cloud relay forwarding (`FORWARDABLE_COMMAND_TYPES` in the cloud relay service) is a
+   separate PR.
+
+**Naming:** No "codex" references in codebase/commits/identifiers. Use
+"app-server JSON-RPC shape" or "reference app-server shape" if needed.
+
+**AppServerClient ergonomic gap pattern:** When a protocol command family is
+added, three surfaces normally need updates: protocol types, inbound validation,
+listener handler, **AppServerClient helper** (often missing), **cloud relay
+forwarding** (often missing), **desktop response passthrough** (often
+missing). Don't eyeball, write a script to diff command types from
+`protocol_v2.ts` against `FORWARDABLE_COMMAND_TYPES`.
+
+### Protocol v1 vs v2
+
+- v1 = session/headless: one running session, raw streaming chunks,
+  `control_request`/`control_response`. Good for: spawn headless -> send prompt
+  -> stream result.
+- v2 = app-server: many runtimes in one environment, explicit runtime scope
+  (agent_id + conversation_id), state snapshots, typed sideband commands, split
+  control/stream channels, idempotency/reconnect/sync.
+
+### `runtime_start`
+
+One-shot entry point: create or resume a runtime scope. Resolution:
+`create_agent` present -> create; else require `agent_id` and retrieve.
+`conversation_id` present -> retrieve; else create for resolved agent.
+
+Response: `created.agent` / `created.conversation` booleans only. Don't leak
+internal implementation details like whether a JS `ConversationRuntime` was
+newly allocated.
+
+---
+
+## Runtime Model Catalog
+
+The model catalog is a dynamic runtime service, not a static `models.json` file.
+
+**API mode (Cloud):** hosted selector rows, labels, presets, and capabilities
+come only from `GET /v1/models/catalog`. `GET /v1/models` contributes only
+organization-specific BYOK rows in Cloud mode; never use its base/hosted rows to
+filter, supplement, delay, or provide a fallback for the hosted catalog. If the
+catalog fails and no cache exists, startup exits with an error. If a cache
+exists, startup uses degraded mode.
+
+**Local and custom App Server mode:** projects the active pi-ai or server
+runtime inventory into `CatalogModel` shape via `toRuntimeCatalogModels()`. If
+pi-ai is unavailable, the local catalog is empty and startup continues.
+
+Cloud BYOK handles may use an organization-specific provider name. Match them
+to catalog metadata through the provider metadata already returned with the
+BYOK row, while retaining the organization-specific handle for selection. Do
+not add provider-name rewrites to make hosted rows from `GET /v1/models` act
+like catalog rows.
+
+Key files: `src/agent/model-catalog.ts`, `src/agent/remote-model-catalog.ts`,
+`src/agent/available-models.ts`, `src/backend/local/local-model-config.ts`.
+
+**Adding a model:** add it at the source that owns it. Hosted presets belong in
+the server's catalog; local models belong in pi-ai or that provider's discovery
+runtime. Change this repository only for Letta Code-specific compatibility, such
+as an established CLI alias in `model-catalog.ts` or provider detection for
+toolset selection in `src/tools/manager.ts`, and derive handles and metadata
+from the runtime catalog instead of copying model definitions. Smoke-test with
+`bun run src/index.ts --new --model <id> -p "hi"`; the headless CI model matrix
+lives in `.github/workflows/ci.yml`.
+
+**Test fixture pattern:** The `models` array is shared mutable state across the
+test suite. Use `setupRuntimeModelCatalogFixture()` (bundles setup + cleanup) from
+`src/test-utils/runtime-model-catalog.ts`. All test files touching the model
+catalog must use this fixture.
+
+---
+
+## Reflection Worktree
+
+Harness manages the worktree lifecycle (not the reflection agent):
+- State: `landed` (clean merge), `noop` (no commits), `retry` (dirty),
+  `pending_integration(reason)` (merge failed, branch preserved).
+- Reflection agent NEVER semantically resolves conflicts.
+- Transcript marked consumed only when memory lands on main.
+- Reflection settings are per-agent; trigger counter is per-conversation.
+- Counter increments on completed assistant steps (not user messages, not tool
+  calls, not interrupted turns).
+
+---
+
+## Cross-Platform Patterns
+
+### Windows Symlinks
+
+`fs.symlink(source, dest, "dir")` on Windows requires elevated privileges
+(Developer Mode or admin). Use `"junction"` type on win32 instead, doesn't
+require elevated privileges.
+
+```ts
+fs.symlink(target, dest, process.platform === "win32" ? "junction" : "dir")
+```
+
+### Windows-Specific
+
+- `PATH` vs `Path` case sensitivity (Node uses `Path`).
+- `node -e 'script'` quoting breaks, use a temp file.
+- `/bin/sh` doesn't exist, don't use in fallback paths.
+- Worktree path length: use shorter dirname (`"wt"` vs `"worktree"`) on Windows.
+- `process.kill(pid, 0)` for stale lock detection works but behavior differs
+  slightly.
+
+### Turbopack Symlinked node_modules
+
+In worktree setups where `node_modules` is symlinked, Turbopack rejects
+symlinks pointing outside the project root. Replace with hard links:
+`rm node_modules && cp -al <source_dir> ./node_modules`.
+
+### next-env.d.ts Regeneration
+
+`next-env.d.ts` gets regenerated during `next dev` with `.next/dev/types/`
+paths. Revert before committing: `git restore next-env.d.ts`.
+
+---
+
+## Git Workflow Patterns
+
+### Squash-Merge Stacked PR Conflicts
+
+PRs use squash merge. When PR A is squash-merged, downstream PR B (stacked on A's
+branch) gets auto-retargeted to main by GitHub, creating conflicts because the
+commits B expected no longer exist.
+
+**Fix:** `git rebase --onto origin/main <pr-a-base-commit> <pr-b-branch>` ,
+replay only PR B's commits onto main, dropping PR A's now-redundant commit.
+
+### Squash-Merge Rebase Trap
+
+After a PR is squash-merged, a branch based on the old unsquashed commits will
+have duplicate changes if you do a normal `git rebase origin/main`.
+
+**Fix:** stash the diff (`git stash push -u`), reset to main
+(`git reset --hard origin/main`), apply the stash (`git stash apply`), resolve
+only the real PR conflicts.
+
+### Stash-Rebase-Apply for Uncommitted Spikes
+
+When a worktree branch has uncommitted spike changes and needs rebasing onto
+fresh main:
+1. `git stash push -u -m "spike: ..."`
+2. `git fetch origin main && git rebase origin/main`
+3. `git stash pop` (conflicts expected)
+4. Resolve conflicts, `git restore --staged .` to unstage
+5. `git stash drop` after clean apply
+
+### bun.lock Churn
+
+Running `bun install` in a worktree may add `"configVersion": 0` after
+`"lockfileVersion": 1` because the local Bun version is newer. Scrub with
+`git checkout main -- bun.lock` when the PR has no real package.json change.
+
+### Git Rebase in Non-Interactive Contexts
+
+`git rebase --continue` opens vim. Use `GIT_EDITOR=true git rebase --continue`
+to accept the default message without opening an editor.
+
+### GitHub Token Types
+
+- `gho_` (OAuth): works for `gh` CLI API calls, NOT for `git push` over HTTPS.
+- `github_pat_` (fine-grained PAT): works for `git push` but only for
+  user-owned repos, NOT org repos unless org approves.
+- `ghp_` (classic PAT): works for everything including `git push` to org repos.
+  This is the right type for pushing to `letta-ai/letta-code`.
+- Push URL: `git push https://<user>:<token>@github.com/<org>/<repo>.git <branch> --force`
+
+### Letta API: `summary_search` not `summary`
+
+`GET /v1/conversations?agent_id=X&summary_search=owner/repo/pr-N` , the param
+is `summary_search`, NOT `summary`. The API silently ignores unknown query
+params; using `summary` returns ALL conversations for the agent.
+
+---
+
+## Shared Remote Server
+
+Some checkouts live on a shared remote macOS server. Multiple
+agents/people share worktrees here.
+
+1. **Never use someone else's git credentials.** Set `GIT_AUTHOR_NAME`,
+   `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL` explicitly
+   when committing.
+2. **Never commit directly on main.** Always work in worktrees.
+3. **Use clearly-named worktrees** prefixed with your own name (e.g.
+   `.letta/worktrees/<name>-rebase-2184`).
+4. **Check existing worktrees** before creating new ones.
+5. **Secrets** available via `$SECRET_NAME` substitution at exec time (not
+   persistent env vars): `GITHUB_TOKEN`, `LETTA_API_KEY`, `SLACK_BOT_TOKEN`,
+   `SLACK_APP_TOKEN`.
+6. **Pre-existing `gh` auth** belongs to another user, do NOT use it.
+7. **Fine-grained PATs don't work for org repos.** Use a classic PAT (`ghp_`
+   prefix) with `repo` scope.
+
+---
+
+## Watcher & Automation Workflows
+
+### Secret Injection Syntax
+
+The harness only supports literal `$NAME` references for secret injection:
+- `$GITHUB_TOKEN` injected
+- `${GITHUB_TOKEN}` not expanded
+- `${GITHUB_TOKEN:?}` not supported
+
+### Repositories API Write Gotcha
+
+`POST /v1/repositories/{id}/files` may return HTTP 500 after successfully
+committing. Safe pattern: attempt write, if non-2xx, read back with
+`GET /files/content?path=...`, compare `content_sha256` to local SHA-256, treat
+as success if hashes match.
+
+---
+
+## Cloud & Teleport
+
+### Cloud Environment Bridge
+
+Cloud API teleport uses a 409 `TELEPORT_SOURCE_NOT_ACTIVE` error when the source
+environment is not active. Rulesets (not branch protection) govern the cloud
+side.
+
+### Desktop Device Selection
+
+`pickDesktopLocalConnection` selects the desktop local connection for device
+routing. Phantom "Interrupted" banners can appear from stale device selection
+state.
+
+### Dual-Listener Heartbeat Oscillation
+
+When desktop runs both a local and cloud listener, heartbeat oscillation can
+occur. Version compatibility between desktop and CLI must be maintained.
